@@ -1,0 +1,19 @@
+In file included from include/test.h:4:0,
+                 from main.cpp:2:
+include/hash_table.h: In instantiation of ‘bool shm_stl::hash_table<_Key, _Value, _HashFunc, _EqualKey>::Insert(shm_stl::hash_table<_Key, _Value, _HashFunc, _EqualKey>::key_type, shm_stl::hash_table<_Key, _Value, _HashFunc, _EqualKey>::value_type) [with _Key = int; _Value = int; _HashFunc = shm_stl::hash<int>; _EqualKey = std::equal_to<int>; shm_stl::hash_table<_Key, _Value, _HashFunc, _EqualKey>::key_type = int; shm_stl::hash_table<_Key, _Value, _HashFunc, _EqualKey>::value_type = int]’:
+include/test.h:16:9:   required from ‘void test(const char*) [with _Key = int; _Value = int]’
+main.cpp:8:24:   required from here
+include/hash_table.h:143:35: error: no matching function for call to ‘shm_stl::hash<int>::hash(shm_stl::hash_table<int, int, shm_stl::hash<int>, std::equal_to<int> >::key_type&)’
+             sig_t sig = hasher(key);
+                                   ^
+include/hash_table.h:143:35: note: candidates are:
+In file included from include/hash_table.h:7:0,
+                 from include/test.h:4,
+                 from main.cpp:2:
+include/hash_fun.h:75:32: note: shm_stl::hash<int>::hash()
+ __SHM_STL_TEMPLATE_NULL struct hash<int> {
+                                ^
+include/hash_fun.h:75:32: note:   candidate expects 0 arguments, 1 provided
+include/hash_fun.h:75:32: note: shm_stl::hash<int>::hash(const shm_stl::hash<int>&)
+include/hash_fun.h:75:32: note:   no known conversion for argument 1 from ‘shm_stl::hash_table<int, int, shm_stl::hash<int>, std::equal_to<int> >::key_type {aka int}’ to ‘const shm_stl::hash<int>&’
+make: *** [main.o] Error 1
