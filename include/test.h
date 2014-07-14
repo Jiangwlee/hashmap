@@ -10,14 +10,20 @@
 using shm_stl::hash_table;
 using namespace std;
 
+struct MyAssign {
+    void operator() (int & old_v, int &new_v) {
+        old_v = new_v;
+    } 
+};
+
 
 template <typename _Key, typename _Value>
 void test(const char *name) {
-    hash_table<_Key, _Value> hash_tbl(64, 8);
+    hash_table<_Key, _Value> hash_tbl(2, 8);
 
 
 #ifdef OCCUPY_HASHMAP
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 1000; ++i) {
         if (!hash_tbl.Insert(i, i * i))
             cout << "Insert <" << i << ", " << i * i << "> fail!" << endl;
     }
@@ -34,10 +40,16 @@ void test(const char *name) {
 
     int key = 18;
     int value = 0;
-    if (hash_tbl.Find(key, &value))
+    if (hash_tbl.Find(key, &value)) {
         cout << "Find key : " << key << " in the hash table! Its value is " << value << "!" << endl;
-    else
+        //shm_stl::Assignment<_Value> assignment;
+        MyAssign assignment;
+        hash_tbl.Update(key, value + 100, assignment);
+        hash_tbl.Find(key, &value);
+        cout << "Update key : " << key << " in the hash table! Its new value is " << value << "!" << endl;
+    } else {
         cout << "Can't find key : " << key << " from the hash table!" << endl;
+    }
     
 #ifdef OCCUPY_HASHMAP
 //    for (int i = 100; i >= 0; --i) {

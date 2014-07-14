@@ -3,22 +3,25 @@
 
 #include <sys/types.h>
 #include <bits/stl_function.h>
+#include <memory.h>
 #include <iostream>
 #include <sstream>
 #include "hash_fun.h"
 #include "common.h"
+#include "bucket.h"
 
 using std::ostream;
     
 __SHM_STL_BEGIN
 
-const u_int32_t DEFAULT_ENTRIES = 4096;
-const u_int32_t DEFAULT_BUCKET_NUM = 512;
+template <typename _Value>
+struct Assignment {
+    void operator() (_Value &old_value, const _Value &new_value) {
+        old_value = new_value;
+    }
+};
 
-/* typedef */
-typedef u_int32_t sig_t;
-typedef u_int32_t uint32;
-typedef int32_t   int32;
+const u_int32_t DEFAULT_ENTRIES = 4096;
 
 template <typename _Key, typename _Value>
 class Node {
@@ -32,8 +35,12 @@ class Node {
         }
 
         void SetNext(Node * next) {m_next = next;}
-        void SetValue(const _Value & value) {m_value = value;}
         void SetIndex(uint32 idx) {m_index = idx;}
+
+        template <typename _Modifier>
+        void Update(_Value & new_value, _Modifier &update) {
+            update(m_value, new_value);
+        }
 
         _Key Key(void) const {return m_key;}
         _Value Value(void) const {return m_value;}
@@ -53,112 +60,197 @@ class Node {
         uint32 m_index; // the index of this node in node list, it should never be changed after initialization
 };
 
-template <typename _Node, typename _Key, typename _KeyEqual>
-class Bucket {
+/*
+ * @brief : FreeNodePool manages free nodes used by hashmap. A hashmap should always
+ *          get a free node from FreeNodePool and return it back when it decides to
+ *          erase a node from hashmap.
+ *
+ *          FreeNodePool can resize itself if all free nodes are exhausted. It creates
+ *          a new free node list whose size is double of previous free node list. The
+ *          max resize count is 32 by default. It means you can create 32 free node
+ *          lists including the first one at most.
+ *
+ *          All free nodes in free node lists are chained together and be accessed
+ *          from m_node_pool_head.
+ *
+ *          This class provides following methods to programmers:
+ *          1. GetNode - Get a free node from FreeNodePool
+ *          2. PutNode - Put a node to FreeNodePool
+ *          3. PutNodeList - Put a list of nodes to FreeNodePool
+ *
+ *          Important:
+ *          1. Programmers should not free any node outside of FreeNodePool
+ *
+ *          Following is a chart to illustrate this class:
+ *
+ *          m_free_list_array --> +-----------------------------------------------+
+ *                                |     |     |     |     |     |     |     |     | 
+ *                                +-----------------------------------------------+
+ *                 [the first list]  |     |   [create the second free list if the first is exhausted]
+ *                                   V     +-----> +-------------------------------+
+ *          m_node_pool_head -->  +-----+          |   |   |   |   |   |   |   |   |
+ *                                |     |          +-------------------------------+
+ *                                +-----+            ^
+ *                                |     |            |
+ *                                +-----+            |
+ *                                |     |            |
+ *                                +-----+            |
+ *                                |     |            | [chain the new created free nodes to m_node_pool_head]
+ *                                +-----+            |
+ *                                   |_______________|
+ *
+ * */
+template <typename _Node>
+class NodePool {
     public:
-        Bucket () : m_size(0), m_head(NULL) {}
-        ~Bucket () {Clear();}
+        typedef _Node node_type;
+        static const uint32 MAX_RESIZE_COUNT = 5;
+        static const uint32 DEFAULT_LIST_SIZE = 16;  // The default size of the first free list
 
-        void Clear(void) {
-            m_size = 0;
-            m_head = NULL;
-        }
+        NodePool(uint32 size) : m_capacity(0), m_free_entries(0), m_free_list_num(0), 
+                                m_next_free_list_size(size), m_node_pool_head(NULL) {
+                                    // Initilize the m_free_list_array
+                                    memset(&m_free_list_array[0], 0, sizeof(m_free_list_array));
+                                    
+                                    // Create the first free list
+                                    Resize();
+                                }
 
-        // Put a node at the head of this bucket
-        void Put(_Node * node) {
-            node->SetNext(m_head);
-            m_head = node;
-            ++m_size;
-        }
-
-        // Lookup a node by signature and key
-        _Node * Lookup(const sig_t &sig, const _Key &key) {
-            // Search in this bucket
-            _Node * current = m_head;
-            _Node * prev = current;
-            while (current) {
-                if (sig == current->Signature() && m_equal_to(key, current->Key())) {
-                    break;
-                }
-
-                prev = current;
-                current = current->Next();
+        ~NodePool() {
+            for (int i = 0; i < m_free_list_num; ++i) {
+                node_type * node_list = m_free_list_array[i];
+                delete [] node_list;
+                m_free_list_array[i] = NULL;
             }
 
-            // If we find this key in bucket, move it to the front of bucket
-            if (current != NULL) {
-                if (current != m_head) {
-                    prev->SetNext(current->Next());
-                    current->SetNext(m_head);
-                    m_head = current;
-                }
-
-#ifdef DEBUG
-                std::ostringstream log;
-                Str(log);
-                std::cout << log.str() << std::endl;
-#endif
-            }
-
-            return current;
+            m_capacity = 0;
+            m_free_entries = 0;
+            m_free_list_num = 0;
+            m_next_free_list_size = DEFAULT_LIST_SIZE;
+            m_node_pool_head = NULL;
         }
 
-        // Remove a node from this bucket
-        _Node * Remove(const sig_t &sig, const _Key &key) {
-            _Node * node = Lookup(sig, key);
+        uint32 Capacity(void) const {return m_capacity;}
+        uint32 FreeEntries(void) const {return m_free_entries;}
 
-            // If we find this node, now it is in the front of our node list,
-            // we just remove it from the head
-            if (node) {
-                m_head = node->Next();
-                node->SetNext(NULL);
-                --m_size;
-#ifdef DEBUG
-                std::ostringstream log;
-                log << "The bucket after a node remove!" << std::endl;
-                Str(log);
-                std::cout << log.str() << std::endl;
-#endif
-            }
+        // Get a free node
+        node_type * GetNode(void) {
+            if (m_node_pool_head == NULL)
+                Resize();
 
-            return node;
-        }
-
-        uint32  Size(void) const {return m_size;}
-        _Node * Head(void) const {return m_head;}
-        _Node * Tail(void) const {
-            if (m_head == NULL)
+            if (m_node_pool_head == NULL)
                 return NULL;
 
-            _Node * current = m_head;
-            while (current->Next()) {
-                current = current->Next();
+            node_type * head = m_node_pool_head;
+            if (head->Next() == NULL) {
+                // If the head is the last free node
+                m_node_pool_head = NULL;
+            } else {
+                // If the head is not the last free node, m_free_node_list points to the next free node
+                m_node_pool_head = head->Next(); 
             }
 
-            // If we find a node whose next is NULL, it is the tail of this bucket
-            return current;
+            --m_free_entries;
+            return head;
         }
 
-        void Str(ostream &os) {
-            os << "\nBucket Size : " << m_size << std::endl;
-            _Node * curr = m_head;
-            while (curr) {
-                curr->Str(os);
-                curr = curr->Next();
+        // Return a node to free list
+        void PutNode(node_type * node) {
+            if (node == NULL)
+                return;
+
+            // Put this node at the front of m_free_node_list
+            node->SetNext(m_node_pool_head); 
+            m_node_pool_head = node;
+
+            ++m_free_entries;
+        }
+
+        // Return nodes in a bucket to free list
+        void PutNodeList(node_type *start, node_type *end, uint32 size) {
+            // If start or end is NULL, do nothing
+            if (!start || !end)
+                return;
+
+            // Put the node list decribed by start and end at the front of m_node_pool_head
+            end->SetNext(m_node_pool_head);
+            m_node_pool_head = start;
+            m_free_entries += size;
+        }
+
+
+        void Print(void) {
+            std::ostringstream os;
+            Str(os);
+            std::cout << os.str() << std::endl;
+
+            os << "\nFree Node Pool : " << std::endl;
+            node_type * start = m_node_pool_head;
+            PrintNode<node_type> action;
+            while (start) {
+                action(*start, os);
+                start = start->Next();
             }
+
+            std::cout << os.str() << std::endl;
         }
 
-    public:
-        uint32 m_size; // the size of this bucket
-        _Node *m_head; // the pointer of the first node in this bucket
-        _KeyEqual m_equal_to;
-}; 
+    private:
+        // Create a new free node list and chain it to free node pool
+        void Resize(void) {
+            // Have reached the maxinum size
+            if (m_free_list_num >= MAX_RESIZE_COUNT)
+                return;
 
-template <typename _Node>
-struct PrintNode {
-    void operator() (const _Node & node) {
-        std::cout << "[" << node.Index() << "] --> ";
-    }
+            // Create a new free list
+            uint32 size = m_next_free_list_size;
+            node_type * new_list = new node_type[size];
+            if (new_list == NULL)
+                return;
+
+            // Now we have created the new free list successfully, add it to m_free_list_array
+            // and free node pool
+            InitializeFreeNodeList(new_list, size, m_capacity);
+            m_free_list_array[m_free_list_num] = new_list;
+            node_type * end_of_list = &new_list[size - 1];
+            PutNodeList(new_list, end_of_list, size); // PutNodeList will calculate m_free_entries
+
+            // Calculate new capacity, free_list_num and next_free_list_size 
+            m_capacity += size;
+            m_free_list_num++;
+            m_next_free_list_size = size << 1;
+
+#ifdef DEBUG
+            std::cout << "Just Resize Node Pool! ...... " << std::endl;
+            Print();
+#endif
+        }
+
+        void InitializeFreeNodeList(node_type *list, uint32 size, uint32 index_start) {
+            uint32 i = 0;
+            for ( ; i < size - 1; ++i) {
+                list[i].SetNext(&list[i + 1]);
+                list[i].SetIndex(index_start++);
+            }
+
+            // Set the index of last node
+            list[i].SetIndex(index_start);
+        }
+
+        void Str(std::ostream &os) {
+            os << "Node Pool Status : " << std::endl;
+            os << "Capacity      : " << m_capacity << std::endl;
+            os << "Free entries  : " << m_free_entries << std::endl;
+            os << "Free list num : " << m_free_list_num << std::endl;
+        }
+
+    private:
+        uint32     m_capacity;            // the capacity of this free node pool
+        uint32     m_free_entries;        // the count of available free nodes in this pool
+        uint32     m_free_list_num;       // how many free lists we have now
+        uint32     m_next_free_list_size; // the size of next free list
+        node_type *m_node_pool_head;      // the head of free node pool
+        node_type *m_free_list_array[MAX_RESIZE_COUNT]; // free lists
 };
 
 template <typename _Key, typename _Value, typename _HashFunc = hash<_Key>, typename _EqualKey = std::equal_to<_Key> >
@@ -170,45 +262,14 @@ class hash_table {
         typedef _HashFunc hasher;
         typedef _EqualKey key_equal;
         typedef Bucket<node_type, key_type, key_equal>  bucket_type;
+        typedef NodePool<node_type> node_pool_type;
+        typedef BucketMgr<bucket_type> bucket_mgr;
 
     public:
-        hash_table(uint32 entries = DEFAULT_ENTRIES, uint32 buckets = DEFAULT_BUCKET_NUM) : m_total_entries(entries), 
-                   m_bucket_num(buckets), m_free_entries(entries), m_bucket_mask(0), m_free_node_list(NULL),      
-                   m_node_array(NULL), m_bucket_array(NULL) {
-#ifdef DEBUG
-                           std::cout << "Initialize hash_table" << std::endl;
-#endif
-                           Initialize();
-                       }
+        hash_table(uint32 entries = DEFAULT_ENTRIES, uint32 buckets = DEFAULT_BUCKET_NUM) : 
+                   m_buckets(buckets), m_node_pool(entries) {}
 
-        ~hash_table(void) {
-            if (m_bucket_array)
-                delete [] m_bucket_array;
-
-            if (m_node_array)
-                delete [] m_node_array;
-        }
-
-        bool Initialize(void) {
-            // Adjust bucket number if necessary
-            if (!is_power_of_2(m_bucket_num))
-                m_bucket_num = convert_to_power_of_2(m_bucket_num);
-
-            m_bucket_mask = m_bucket_num - 1;
-
-            // Allocate memory for hash_table
-            m_bucket_array = new bucket_type[m_bucket_num];
-            if (m_bucket_array == NULL)
-                return false;
-
-            m_node_array = new node_type[m_total_entries];
-            if (m_node_array == NULL) {
-                delete [] m_bucket_array;
-                return false;
-            }
-
-            InitializeFreeList();
-        }
+        ~hash_table(void) {}
 
         bool Insert(const key_type & key, const value_type & value) {
             // Check if this key is already in hash table
@@ -216,7 +277,7 @@ class hash_table {
                 return false;
                         
             // Get a new node from free list
-            node_type * node = GetNodeFromFreeList();
+            node_type * node = m_node_pool.GetNode();
             if (node == NULL)
                 return false;
 
@@ -225,11 +286,11 @@ class hash_table {
             node->Fill(key, value, sig);
 
             // Put node to bucket
-            bucket_type * bucket = GetBucketBySig(sig); 
+            bucket_type * bucket = m_buckets.GetBucketBySig(sig); 
             bucket->Put(node);
 
 #ifdef DEBUG
-            PrintFreeList();
+            m_node_pool.Print();
             PrintBucketList(*bucket);
 #endif
 
@@ -257,16 +318,16 @@ class hash_table {
         bool Erase(const key_type &key, value_type * ret = NULL) {
             // Compute signature and get bucket
             sig_t sig = m_hash_func(key);
-            bucket_type * bucket = GetBucketBySig(sig);
+            bucket_type * bucket = m_buckets.GetBucketBySig(sig);
 
             // Remove this node from bucket
             if (bucket) { 
                 node_type * node = bucket->Remove(sig, key);
                 if (node) {
                     // Put this node to free node list
-                    PutNodeToFreeList(node);
+                    m_node_pool.PutNode(node);
 #ifdef DEBUG
-                    PrintFreeList();
+                    m_node_pool.Print();
                     PrintBucketList(*bucket);
 #endif
                     return true;
@@ -274,119 +335,73 @@ class hash_table {
             }
 
 #ifdef DEBUG
-            PrintFreeList();
+            m_node_pool.Print();
             PrintBucketList(*bucket);
 #endif
 
             return false;
         }
 
+        // Update the value
+        template <typename _Modifier>
+        bool Update(const key_type & key, value_type new_value, _Modifier &update) {
+            node_type * node = LookupNodeByKey(key);
+            if (node) {
+                node->Update(new_value, update); 
+            } else {
+                return false;
+            }
+        }
+
         // Clear this hash table
         void Clear(void) {
-            for (int i = 0; i < m_bucket_num; ++i) {
-                PutBucketToFreeList(m_bucket_array[i]);
+            for (int i = 0; i < m_buckets.Size(); ++i) {
+                PutBucketToFreeList(m_buckets.GetBucketByIndex(i));
             }
-        }
-
-        void Str(ostream & os) {
-            os << "\nHash Table Information : " << std::endl;
-            os << "** Total Entries : " << m_total_entries << std::endl;
-            os << "** Free  Entries : " << m_free_entries << std::endl;
-            os << "** Total Buckets : " << m_bucket_num << std::endl;
-            os << "** Bucket Mask   : 0x" << std::hex << m_bucket_mask << std::dec << std::endl;
-
-            for (int i = 0; i < m_bucket_num; ++i) {
-                os << std::endl;
-                os << "Bucket[" << i << "]" << std::endl;
-                m_bucket_array[i].Str(os); 
-            }
-        }
-
-    private:
-        void InitializeFreeList(void) {
-            m_free_node_list = &m_node_array[0];
-            int32 i = 0;
-            for ( ; i < m_total_entries - 1; ++i) {
-                m_node_array[i].SetNext(&m_node_array[i + 1]);
-                m_node_array[i].SetIndex(i);
-            }
-
-            // Set the index of last node
-            m_node_array[i].SetIndex(i);
-
 #ifdef DEBUG
-            PrintFreeList();
+            m_node_pool.Print();
 #endif
         }
 
+        void Str(ostream & os) const {
+            os << "\nHash Table Information : " << std::endl;
+            os << "** Total Entries : " << m_node_pool.Capacity() << std::endl;
+            os << "** Free  Entries : " << m_node_pool.FreeEntries() << std::endl;
+            m_buckets.Str(os);
+        }
+
+    private:
         template <typename _Action>
-        void TravelNodeList(node_type * head, _Action action) const {
+        void TravelNodeList(node_type * head, _Action action, ostream &os) const {
             if (head == NULL)
                 return;
 
             node_type * current_node = head;
             while (current_node != NULL) {
-                action(*current_node);
+                action(*current_node, os);
                 current_node = current_node->Next();
             }
         }
 
-        bucket_type * GetBucketBySig(sig_t sig) {
-            bucket_type * ret = &m_bucket_array[sig & m_bucket_mask];
-        }
-
-        // Get a free node
-        node_type * GetNodeFromFreeList(void) {
-            if (m_free_node_list == NULL)
-                return NULL;
-
-            node_type * head = m_free_node_list;
-            if (head->Next() == NULL) {
-                // If the head is the last free node
-                m_free_node_list = NULL;
-            } else {
-                // If the head is not the last free node, m_free_node_list points to the next free node
-                m_free_node_list = head->Next(); 
-            }
-
-            --m_free_entries;
-            return head;
-        }
-
-        // Return a node to free list
-        void PutNodeToFreeList(node_type * node) {
-            if (node == NULL)
-                return;
-
-            // Put this node at the front of m_free_node_list
-            node->SetNext(m_free_node_list); 
-            m_free_node_list = node;
-
-            ++m_free_entries;
-        }
 
         // Return nodes in a bucket to free list
-        void PutBucketToFreeList(bucket_type &bucket) {
-            node_type * start = bucket.Head();
-            node_type * end   = bucket.Tail();
-
-            // If start or end is NULL, do nothing
-            if (!start || !end)
+        void PutBucketToFreeList(bucket_type *bucket) {
+            if (bucket == NULL)
                 return;
 
-            // Put the node list decribed by start and end at the front of m_free_node_list
-            end->SetNext(m_free_node_list);
-            m_free_node_list = start;
-            m_free_entries += bucket.Size();
-            
+            node_type * start = bucket->Head();
+            node_type * end   = bucket->Tail();
+
+            // Put nodes to m_node_pool
+            m_node_pool.PutNodeList(start, end, bucket->Size());
+
             // Now it is time to clear bucket
-            bucket.Clear();
+            bucket->Clear();
 
 #ifdef DEBUG
-            PrintFreeList();
-            PrintBucketList(bucket);
+            PrintBucketList(*bucket);
             std::ostringstream log;
-            bucket.Str(log);
+            bucket->Str(log);
             std::cout << log.str() << std::endl;
 #endif
         }
@@ -396,7 +411,7 @@ class hash_table {
 
             // Compute signature and get bucket
             sig_t sig = m_hash_func(key);
-            bucket_type * bucket = GetBucketBySig(sig);
+            bucket_type * bucket = m_buckets.GetBucketBySig(sig);
 
             // Search in this bucket
             if (bucket)
@@ -406,26 +421,17 @@ class hash_table {
         }
 
         void PrintBucketList(const bucket_type &bucket) const {
+            std::ostringstream os;
             PrintNode<node_type> action;
-            std::cout << "\nCurrent Bucket is : " << std::endl;
-            TravelNodeList(bucket.Head(), action);
-        }
-
-        void PrintFreeList(void) const {
-            PrintNode<node_type> action;
-            std::cout << "\nFree List is : " << std::endl;
-            TravelNodeList(m_free_node_list, action);
+            os << "\nCurrent Bucket is : " << std::endl;
+            TravelNodeList(bucket.Head(), action, os);
+            std::cout << os.str() << std::endl;
         }
         
     private:
-        uint32       m_total_entries;
-        uint32       m_bucket_num;           // the number of buckets, should be power of 2
-        uint32       m_free_entries;
-        uint32       m_bucket_mask;
-        node_type   *m_free_node_list;      // the head of free node list
-        node_type   *m_node_array;
-        bucket_type *m_bucket_array;
-        hasher       m_hash_func;
+        hasher         m_hash_func;
+        node_pool_type m_node_pool;
+        bucket_mgr     m_buckets;
 };
 
 __SHM_STL_END
