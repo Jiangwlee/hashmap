@@ -57,6 +57,12 @@ template <typename _Node, typename _Key, typename _KeyEqual>
 class Bucket {
     public:
         Bucket () : m_size(0), m_head(NULL) {}
+        ~Bucket () {Clear();}
+
+        void Clear(void) {
+            m_size = 0;
+            m_head = NULL;
+        }
 
         // Put a node at the head of this bucket
         void Put(_Node * node) {
@@ -120,6 +126,18 @@ class Bucket {
 
         uint32  Size(void) const {return m_size;}
         _Node * Head(void) const {return m_head;}
+        _Node * Tail(void) const {
+            if (m_head == NULL)
+                return NULL;
+
+            _Node * current = m_head;
+            while (current->Next()) {
+                current = current->Next();
+            }
+
+            // If we find a node whose next is NULL, it is the tail of this bucket
+            return current;
+        }
 
         void Str(ostream &os) {
             os << "\nBucket Size : " << m_size << std::endl;
@@ -198,7 +216,7 @@ class hash_table {
                 return false;
                         
             // Get a new node from free list
-            node_type * node = GetNode();
+            node_type * node = GetNodeFromFreeList();
             if (node == NULL)
                 return false;
 
@@ -211,11 +229,8 @@ class hash_table {
             bucket->Put(node);
 
 #ifdef DEBUG
-            PrintNode<node_type> action;
-            std::cout << "\n\nFree List is : " << std::endl;
-            TravelNodeList(m_free_node_list, action);
-            std::cout << "\nCurrent Bucket is : " << std::endl;
-            TravelNodeList(bucket->Head(), action);
+            PrintFreeList();
+            PrintBucketList(*bucket);
 #endif
 
             return true;
@@ -249,27 +264,28 @@ class hash_table {
                 node_type * node = bucket->Remove(sig, key);
                 if (node) {
                     // Put this node to free node list
-                    PutNode(node);
+                    PutNodeToFreeList(node);
 #ifdef DEBUG
-                    PrintNode<node_type> action;
-                    std::cout << "\nFree List is : " << std::endl;
-                    TravelNodeList(m_free_node_list, action);
-                    std::cout << "\nCurrent Buckete is : " << std::endl;
-                    TravelNodeList(bucket->Head(), action);
+                    PrintFreeList();
+                    PrintBucketList(*bucket);
 #endif
                     return true;
                 }
             }
 
 #ifdef DEBUG
-            PrintNode<node_type> action;
-            std::cout << "\nFree List is : " << std::endl;
-            TravelNodeList(m_free_node_list, action);
-            std::cout << "\nCurrent Buckete is : " << std::endl;
-            TravelNodeList(bucket->Head(), action);
+            PrintFreeList();
+            PrintBucketList(*bucket);
 #endif
 
             return false;
+        }
+
+        // Clear this hash table
+        void Clear(void) {
+            for (int i = 0; i < m_bucket_num; ++i) {
+                PutBucketToFreeList(m_bucket_array[i]);
+            }
         }
 
         void Str(ostream & os) {
@@ -299,8 +315,7 @@ class hash_table {
             m_node_array[i].SetIndex(i);
 
 #ifdef DEBUG
-            PrintNode<node_type> action;
-            TravelNodeList(m_free_node_list, action);
+            PrintFreeList();
 #endif
         }
 
@@ -321,7 +336,7 @@ class hash_table {
         }
 
         // Get a free node
-        node_type * GetNode(void) {
+        node_type * GetNodeFromFreeList(void) {
             if (m_free_node_list == NULL)
                 return NULL;
 
@@ -339,20 +354,41 @@ class hash_table {
         }
 
         // Return a node to free list
-        void PutNode(node_type * node) {
+        void PutNodeToFreeList(node_type * node) {
             if (node == NULL)
                 return;
 
-            if (m_free_node_list == NULL) {
-                // If m_free_node_list is NULL, put this node as the head
-                m_free_node_list = node;
-            } else {
-                // If m_free_node_list is not NULL, put this node at the head position
-                node->SetNext(m_free_node_list); 
-                m_free_node_list = node;
-            }
+            // Put this node at the front of m_free_node_list
+            node->SetNext(m_free_node_list); 
+            m_free_node_list = node;
 
             ++m_free_entries;
+        }
+
+        // Return nodes in a bucket to free list
+        void PutBucketToFreeList(bucket_type &bucket) {
+            node_type * start = bucket.Head();
+            node_type * end   = bucket.Tail();
+
+            // If start or end is NULL, do nothing
+            if (!start || !end)
+                return;
+
+            // Put the node list decribed by start and end at the front of m_free_node_list
+            end->SetNext(m_free_node_list);
+            m_free_node_list = start;
+            m_free_entries += bucket.Size();
+            
+            // Now it is time to clear bucket
+            bucket.Clear();
+
+#ifdef DEBUG
+            PrintFreeList();
+            PrintBucketList(bucket);
+            std::ostringstream log;
+            bucket.Str(log);
+            std::cout << log.str() << std::endl;
+#endif
         }
 
         node_type * LookupNodeByKey(const key_type & key) {
@@ -367,6 +403,18 @@ class hash_table {
                 return bucket->Lookup(sig, key); 
             else
                 return NULL;
+        }
+
+        void PrintBucketList(const bucket_type &bucket) const {
+            PrintNode<node_type> action;
+            std::cout << "\nCurrent Bucket is : " << std::endl;
+            TravelNodeList(bucket.Head(), action);
+        }
+
+        void PrintFreeList(void) const {
+            PrintNode<node_type> action;
+            std::cout << "\nFree List is : " << std::endl;
+            TravelNodeList(m_free_node_list, action);
         }
         
     private:

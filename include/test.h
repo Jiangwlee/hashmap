@@ -40,10 +40,11 @@ void test(const char *name) {
         cout << "Can't find key : " << key << " from the hash table!" << endl;
     
 #ifdef OCCUPY_HASHMAP
-    for (int i = 100; i >= 0; --i) {
-        if (!hash_tbl.Erase(i))
-            cout << "Erase <" << i << "> fail!" << endl;
-    }
+//    for (int i = 100; i >= 0; --i) {
+//        if (!hash_tbl.Erase(i))
+//            cout << "Erase <" << i << "> fail!" << endl;
+//    }
+    hash_tbl.Clear();
 #else
     hash_tbl.Erase(1);
     hash_tbl.Erase(17);
